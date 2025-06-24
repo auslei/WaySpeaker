@@ -29,7 +29,7 @@ def main():
     tone_color_converter.load_ckpt(f'{ckpt_converter}/checkpoint.pth')
 
     # Load speaker embedding (SE) from a reference voice sample
-    reference_speaker = 'reference_voice/leilei_cn.m4a'
+    reference_speaker = 'reference_voice/leilei_cn2.m4a'
     target_se, _ = se_extractor.get_se(reference_speaker, tone_color_converter, vad=True)
 
     # Texts to synthesize (can add more languages/voices as needed)
@@ -44,7 +44,7 @@ def main():
 
     # Temporary output path for base synthesis before tone conversion
     tmp_path = os.path.join(output_dir, 'tmp.wav')
-    speed = 1.0  # Synthesis speed multiplier
+    speed = 0.8  # Synthesis speed multiplier
 
     for language, text in texts.items():
         # Get speaker ID for the TTS model

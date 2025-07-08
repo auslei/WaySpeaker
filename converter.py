@@ -1,76 +1,157 @@
+"""
+Convert base TTS audio into a target speaker's tone/color using openvoice.
+
+Usage:
+  python converter.py <text> <language> <reference_file>
+                      [--output-dir DIR] [--speed FLOAT]
+                      [--encode-message TEXT]
+"""
 import os
+import argparse
+import logging
+import tempfile
+from pathlib import Path
+
+# Ensure offline mode for transformers before any imports that may load it
+os.environ["TRANSFORMERS_OFFLINE"] = "0"
+
 import torch
 from openvoice import se_extractor
 from openvoice.api import ToneColorConverter
 from melo.api import TTS
 
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# module-level logger
+logger = logging.getLogger(__name__)
 
-def main():
-    # Set device (use GPU if available, otherwise CPU)
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-    # Paths
-    checkpoints_path = 'checkpoints/checkpoints_v2'
-    ckpt_converter = f'{checkpoints_path}/converter'
-    output_dir = 'output'  # Make sure this matches your actual folder name
-    os.makedirs(output_dir, exist_ok=True)  # Create output dir if it doesn't exist
+def get_device() -> str:
+    """Auto-detect torch device: MPS (Apple M1), CUDA, or CPU."""
+    if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return 'mps'
+    if torch.cuda.is_available():
+        return 'cuda:0'
 
-    # Initialize MeloTTS model for Chinese
-    model = TTS(language="ZH", device=device)
-    print("Available speakers:", list(model.hps.data.spk2id.keys()))
-    speaker_ids = model.hps.data.spk2id
+    return 'cpu'
 
-    # Initialize tone color converter with its config and checkpoint
-    tone_color_converter = ToneColorConverter(
-        config_path=f'{ckpt_converter}/config.json',
-        device=device
+# Default checkpoints directory (v2)
+CKPT_DIR = Path('checkpoints/checkpoints_v2')
+
+
+def read_text_input(input_text: str) -> str:
+    """Read text from input which can be either a string or a file path."""
+    if os.path.isfile(input_text):
+        try:
+            with open(input_text, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        except Exception as e:
+            raise ValueError(f"Error reading file {input_text}: {str(e)}")
+    return input_text
+
+
+def convert_text(
+    text: str,
+    speaker_key: str,
+    reference_file: Path,
+    output_dir: Path,
+    speed: float = 0.8,
+    encode_message: str = '@MyShell', #add a watermark to identify origin of the sound.
+) -> Path:
+    """
+    Synthesize `text` for `speaker_key` and apply tone-color conversion using the
+    reference voice in `reference_file`. Results are written to `output_dir`.
+
+    Returns the path to the converted WAV file.
+    """
+    device = get_device()
+    # Initialize TTS model
+    model = TTS(language=speaker_key, device=device)
+    # Load base speaker embedding
+    file_key = speaker_key.lower().replace('_', '-')
+    source_se = torch.load(
+        str(CKPT_DIR / 'base_speakers' / 'ses' / f'{file_key}.pth'),
+        map_location=device,
     )
-    tone_color_converter.load_ckpt(f'{ckpt_converter}/checkpoint.pth')
+    # Initialize converter
+    converter = ToneColorConverter(
+        config_path=str(CKPT_DIR / 'converter' / 'config.json'),
+        device=device,
+    )
+    converter.load_ckpt(str(CKPT_DIR / 'converter' / 'checkpoint.pth'))
+    # Extract target speaker embedding
+    target_se, _ = se_extractor.get_se(str(reference_file), converter, vad=True)
 
-    # Load speaker embedding (SE) from a reference voice sample
-    reference_speaker = 'reference_voice/leilei_cn2.m4a'
-    target_se, _ = se_extractor.get_se(reference_speaker, tone_color_converter, vad=True)
+    # Synthesize base audio
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_wav:
+        tmp_path = Path(tmp_wav.name)
+    with torch.no_grad():
+        speaker_id = model.hps.data.spk2id[speaker_key]
+        model.tts_to_file(text, speaker_id, str(tmp_path), speed=speed)
 
-    # Texts to synthesize (can add more languages/voices as needed)
-    texts = {
-        'ZH': (
-            "欢迎来到位于Mt Waverley的Amber Grove——现代建筑与永恒舒适的完美结合。"
-            "这座精心设计的住宅拥有宽敞的开放式格局、高端装修，"
-            "以及室内外自然衔接的生活空间。坐落在宁静绿荫街道，"
-            "是追求品质、空间与便利的家庭理想之选。"
-        )
-    }
-
-    # Temporary output path for base synthesis before tone conversion
-    tmp_path = os.path.join(output_dir, 'tmp.wav')
-    speed = 0.8  # Synthesis speed multiplier
-
-    for language, text in texts.items():
-        # Get speaker ID for the TTS model
-        speaker_id = speaker_ids[language]
-
-        # Load the base speaker embedding used for TTS synthesis
-        speaker_key = language.lower().replace('_', '-')
-        source_se_path = f'{checkpoints_path}/base_speakers/ses/{speaker_key}.pth'
-        source_se = torch.load(source_se_path, map_location=device)
-
-        # Synthesize base audio from text using source speaker
-        model.tts_to_file(text, speaker_id, tmp_path, speed=speed)
-
-        # Output path for final converted voice
-        final_path = os.path.join(output_dir, f'output_v2_{language}.wav')
-
-        # Apply tone color conversion to make the voice sound like the reference speaker
-        encode_message = "@MyShell"
-        tone_color_converter.convert(
-            audio_src_path=tmp_path,
+    # Apply tone-color conversion
+    final_path = output_dir / f'output_{speaker_key}.wav'
+    with torch.no_grad():
+        converter.convert(
+            audio_src_path=str(tmp_path),
             src_se=source_se,
             tgt_se=target_se,
-            output_path=final_path,
-            message=encode_message
+            output_path=str(final_path),
+            message=encode_message,
         )
+    try:
+        tmp_path.unlink()
+    except Exception:
+        pass
+    logger.info('Generated converted audio: %s', final_path)
+    return final_path
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(
+        description="Synthesize text and apply tone-color conversion"
+    )
+    parser.add_argument('text', help='Text to synthesize (either direct string or path to a text file)')
+    parser.add_argument(
+        'language',
+        help='Speaker key/language (e.g. ZH, JA, EN_US, EN_UK, EN_AU)',
+    )
+    parser.add_argument(
+        'reference_file',
+        type=Path,
+        help='Path to reference audio file for target voice embedding',
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=Path,
+        default=Path('output'),
+        help='Directory to write converted audio',
+    )
+    parser.add_argument(
+        '--speed',
+        type=float,
+        default=0.8,
+        help='Synthesis speed multiplier',
+    )
+    parser.add_argument(
+        '--encode-message',
+        type=str,
+        default='@MyShell',
+        help='Message tag for tone-color encoder',
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    convert_text(
+        text=read_text_input(args.text),
+        speaker_key=args.language,
+        reference_file=args.reference_file,
+        output_dir=args.output_dir,
+        speed=args.speed,
+        encode_message=args.encode_message,
+    )
+
+
+if __name__ == '__main__':
     main()

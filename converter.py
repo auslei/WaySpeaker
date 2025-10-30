@@ -19,7 +19,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-# Ensure offline mode for transformers before any imports that may load it
+# Enable online mode for transformers to download models if needed
 os.environ["TRANSFORMERS_OFFLINE"] = "0"
 
 import torch
@@ -37,7 +37,7 @@ def get_device() -> str:
         return 'mps'
     if torch.cuda.is_available():
         return 'cuda:0'
-
+    
     return 'cpu'
 
 # Default checkpoints directory (v2)
